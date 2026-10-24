@@ -1,0 +1,813 @@
+#!/usr/bin/env python3
+"""amazing-grok — talk to Grok and dictate with it, from one hotkey.
+
+Usage: amazing-grok tap|login|talk|dictate|stop|status|json
+
+  tap      bind your hotkey to this. One press toggles dictation; a quick
+           double press starts a voice conversation with Grok. While a
+           conversation is running, any press ends it.
+  login    sign in with your xAI account in the browser (OAuth + PKCE)
+  talk     toggle a voice conversation (same as a double tap)
+  dictate  toggle dictation (same as a single tap)
+  stop     end whatever is running
+  status   idle|recording|transcribing|talking|error
+  json     waybar custom module payload
+
+Dictation streams the mic to xAI's /v1/stt and types the words into the
+focused window as you speak. A conversation streams the mic to the Grok Voice
+realtime API (wss /v1/realtime) and plays Grok's answers; Grok can search the
+web and X on its own (server-side web_search and x_search tools).
+
+Auth is an xAI OAuth session, refreshed on demand. The refresh token is
+single-use, so refresh happens under a lock file and the new grant is written
+(atomically) before anything else can fail. A Wizard sign-in in
+~/.wizard/xai_oauth.json is reused when there is no session of our own.
+XAI_API_KEY works too.
+"""
+import array
+import base64
+import fcntl
+import hashlib
+import html
+import http.server
+import json
+import os
+import queue
+import shutil
+import signal
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from pathlib import Path
+
+MAC = sys.platform == "darwin"
+
+API_HOST = "api.x.ai"
+STT_MODEL = "grok-voice-transcribe-2.0"
+VOICE_MODEL = os.environ.get("AMAZING_GROK_MODEL", "grok-voice-3.0")
+VOICE = os.environ.get("AMAZING_GROK_VOICE", "eve")
+LANGUAGE = os.environ.get("AMAZING_GROK_LANG", "en")
+INSTRUCTIONS = os.environ.get("AMAZING_GROK_INSTRUCTIONS", (
+    "You are Grok, talking with the user out loud through their computer. "
+    "Keep replies short and conversational, like a friend on a call: no lists, "
+    "no markdown, no reading out URLs. For anything current, news, prices, "
+    "weather or what people are saying, use web_search or x_search first."))
+# With speakers instead of headphones Grok hears itself and interrupts itself,
+# so the mic is muted while Grok speaks. Set AMAZING_GROK_BARGE_IN=1 with
+# headphones to be able to talk over it.
+BARGE_IN = os.environ.get("AMAZING_GROK_BARGE_IN", "0") == "1"
+
+DOUBLE_TAP_S = float(os.environ.get("AMAZING_GROK_DOUBLE_TAP_MS", "350")) / 1000
+STT_RATE, TALK_RATE = 16000, 24000
+MAX_DICTATE_S = 600
+MAX_TALK_S = 1800
+DONE_TIMEOUT_S = 8
+ECHO_TAIL_S = 0.3
+
+# xAI's public OAuth client (the Grok CLI client), and the one loopback
+# redirect registered for it.
+CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+SCOPE = "openid profile email offline_access grok-cli:access api:access"
+CALLBACK_PORT = 56121
+DISCOVERY_URL = "https://auth.x.ai/.well-known/openid-configuration"
+EXPIRY_LEEWAY_S = 120
+
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "amazing-grok"
+OWN_TOKENS = CONFIG / "xai_oauth.json"
+WIZARD_TOKENS = Path.home() / ".wizard" / "xai_oauth.json"
+RUN = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/amazing-grok-{os.getuid()}") / "amazing-grok"
+STATE, MSG, LOG = RUN / "state", RUN / "message", RUN / "log"
+TAP = RUN / "tap"
+PIDS = {"dictate": RUN / "dictate.pid", "talk": RUN / "talk.pid"}
+
+
+# ── state (for waybar or any status bar) ─────────────────────
+
+def log(msg):
+    try:
+        with open(LOG, "a") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+def alive(name):
+    try:
+        os.kill(int(PIDS[name].read_text()), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def read_state():
+    try:
+        s = STATE.read_text().strip()
+    except OSError:
+        return "idle"
+    # A reboot or a crash leaves a stale state behind.
+    if s in ("recording", "transcribing") and not alive("dictate"):
+        return "idle"
+    if s == "talking" and not alive("talk"):
+        return "idle"
+    return s or "idle"
+
+
+def set_state(state, message=""):
+    RUN.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(state)
+    MSG.write_text(message)
+    if not MAC and shutil.which("pkill"):
+        subprocess.run(["pkill", "-SIGRTMIN+2", "waybar"], stderr=subprocess.DEVNULL)
+
+
+def cmd_json():
+    state = read_state()
+    try:
+        message = MSG.read_text().strip()
+    except OSError:
+        message = ""
+    text, tip = {
+        "idle": ("<span alpha='55%'>󰍬</span>", "Tap: dictate · double tap: talk to Grok"),
+        "recording": ("<span foreground='#f7768e' weight='bold'>󰑊 REC</span>", "Dictating… tap to stop"),
+        "transcribing": ("<span foreground='#e0af68'>󰦖 …</span>", "Finishing transcript…"),
+        "talking": ("<span foreground='#7aa2f7' weight='bold'>󱚣 GROK</span>", "Talking to Grok… tap to hang up"),
+        "error": ("<span foreground='#f7768e'>󰍭 !</span>", html.escape(message or "amazing-grok failed")),
+    }[state]
+    print(json.dumps({"text": f"  {text}  ", "class": state, "tooltip": tip}, ensure_ascii=False), flush=True)
+
+
+# ── xAI auth ──────────────────────────────────────────────────
+
+def jwt_exp(token):
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("exp", 0)
+    except (IndexError, ValueError):
+        return 0
+
+
+def token_path():
+    if OWN_TOKENS.exists() or not WIZARD_TOKENS.exists():
+        return OWN_TOKENS
+    return WIZARD_TOKENS
+
+
+def load_tokens(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        raise RuntimeError("not signed in to xAI — run `amazing-grok login`")
+
+
+def save_tokens(path, tokens):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(tokens, f)
+    os.replace(tmp, path)
+
+
+def check_endpoint(url):
+    host = urllib.parse.urlparse(url).hostname or ""
+    if not url.startswith("https://") or not (host == "x.ai" or host.endswith(".x.ai")):
+        raise RuntimeError(f"refusing unexpected xAI endpoint {url!r}")
+
+
+def post_form(url, form):
+    check_endpoint(url)
+    req = urllib.request.Request(url, urllib.parse.urlencode(form).encode(), {"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r)
+
+
+def refresh_tokens(spent=None):
+    """Rotate the grant under the lock. `spent` is the access token the caller
+    found stale; if the file already holds a newer one, someone else refreshed
+    and we use theirs."""
+    path = token_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(str(path) + ".lock", "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        tokens = load_tokens(path)
+        current = tokens["access_token"]
+        if current != spent and jwt_exp(current) > time.time() + EXPIRY_LEEWAY_S:
+            return current
+        if not tokens.get("refresh_token"):
+            raise RuntimeError("xAI session has no refresh token — run `amazing-grok login`")
+        try:
+            fresh = post_form(tokens.get("token_endpoint", ""), {
+                "grant_type": "refresh_token", "client_id": CLIENT_ID,
+                "refresh_token": tokens["refresh_token"]})
+        except urllib.error.HTTPError as e:
+            if e.code in (400, 401):
+                raise RuntimeError("xAI session expired — run `amazing-grok login`")
+            raise
+        tokens["access_token"] = fresh["access_token"]
+        if fresh.get("refresh_token"):
+            tokens["refresh_token"] = fresh["refresh_token"]
+        save_tokens(path, tokens)
+        return tokens["access_token"]
+
+
+def access_token():
+    if os.environ.get("XAI_API_KEY") and not token_path().exists():
+        return os.environ["XAI_API_KEY"]
+    token = load_tokens(token_path())["access_token"]
+    if jwt_exp(token) <= time.time() + EXPIRY_LEEWAY_S:
+        token = refresh_tokens(spent=token)
+    return token
+
+
+def cmd_login():
+    """Authorization code + PKCE against auth.x.ai, callback on the one
+    loopback port xAI has registered for this client."""
+    with urllib.request.urlopen(DISCOVERY_URL, timeout=15) as r:
+        disc = json.load(r)
+    check_endpoint(disc["authorization_endpoint"])
+    check_endpoint(disc["token_endpoint"])
+    verifier = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = os.urandom(16).hex()
+    redirect = f"http://127.0.0.1:{CALLBACK_PORT}/callback"
+    url = disc["authorization_endpoint"] + "?" + urllib.parse.urlencode({
+        "response_type": "code", "client_id": CLIENT_ID, "redirect_uri": redirect,
+        "scope": SCOPE, "code_challenge": challenge, "code_challenge_method": "S256",
+        "state": state, "nonce": os.urandom(16).hex(), "plan": "generic", "referrer": "amazing-grok"})
+    got = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = urllib.parse.urlparse(self.path)
+            if q.path != "/callback":
+                self.send_error(404)
+                return
+            got.update({k: v[0] for k, v in urllib.parse.parse_qs(q.query).items()})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write("<h2>Signed in. You can close this tab.</h2>".encode())
+
+        def log_message(self, *_):
+            pass
+
+    try:
+        server = http.server.HTTPServer(("127.0.0.1", CALLBACK_PORT), Handler)
+    except OSError:
+        sys.exit(f"port {CALLBACK_PORT} is busy (another xAI sign-in?); close it and retry")
+    print(f"Opening your browser to sign in with xAI. If it doesn't open, visit:\n\n  {url}\n")
+    webbrowser.open(url)
+    server.timeout = 300
+    while "code" not in got and "error" not in got:
+        server.handle_request()
+        if not got:
+            sys.exit("timed out waiting for the browser")
+    server.server_close()
+    if got.get("error") or got.get("state") != state:
+        sys.exit(f"sign-in failed: {got.get('error') or 'state mismatch'}")
+    tok = post_form(disc["token_endpoint"], {
+        "grant_type": "authorization_code", "code": got["code"], "redirect_uri": redirect,
+        "client_id": CLIENT_ID, "code_verifier": verifier,
+        # xAI quirk: the exchange must repeat the challenge as well.
+        "code_challenge": challenge, "code_challenge_method": "S256"})
+    save_tokens(OWN_TOKENS, {
+        "access_token": tok["access_token"], "refresh_token": tok.get("refresh_token"),
+        "token_type": tok.get("token_type", "Bearer"), "token_endpoint": disc["token_endpoint"]})
+    print(f"Signed in. Tokens saved to {OWN_TOKENS}")
+
+
+# ── minimal WebSocket client (stdlib has none) ───────────────
+
+class WSError(Exception):
+    def __init__(self, status):
+        super().__init__(f"websocket handshake failed: HTTP {status}")
+        self.status = status
+
+
+class WS:
+    def __init__(self, host, path, headers):
+        raw = socket.create_connection((host, 443), timeout=15)
+        self.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+        key = base64.b64encode(os.urandom(16)).decode()
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+               f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n")
+        req += "".join(f"{k}: {v}\r\n" for k, v in headers.items()) + "\r\n"
+        self.sock.sendall(req.encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise WSError("closed")
+            buf += chunk
+        head, self.buf = buf.split(b"\r\n\r\n", 1)
+        status = head.split(b"\r\n", 1)[0].split()
+        if len(status) < 2 or status[1] != b"101":
+            raise WSError(status[1].decode() if len(status) > 1 else "?")
+        self.sock.settimeout(None)
+        self.wlock = threading.Lock()
+
+    def send(self, op, data):
+        n = len(data)
+        hdr = bytes([0x80 | op])
+        if n < 126:
+            hdr += bytes([0x80 | n])
+        elif n < 65536:
+            hdr += bytes([0x80 | 126]) + struct.pack(">H", n)
+        else:
+            hdr += bytes([0x80 | 127]) + struct.pack(">Q", n)
+        mask = os.urandom(4)
+        # XOR the payload with the mask as one big integer: fast enough for audio.
+        m = int.from_bytes((mask * (n // 4 + 1))[:n], "big")
+        masked = (int.from_bytes(data, "big") ^ m).to_bytes(n, "big") if n else b""
+        with self.wlock:
+            self.sock.sendall(hdr + mask + masked)
+
+    def send_json(self, obj):
+        self.send(1, json.dumps(obj).encode())
+
+    def _need(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise EOFError
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def recv(self):
+        """Next text message, or None once the peer closes."""
+        msg = b""
+        while True:
+            try:
+                b0, b1 = self._need(2)
+                n = b1 & 0x7F
+                if n == 126:
+                    n = struct.unpack(">H", self._need(2))[0]
+                elif n == 127:
+                    n = struct.unpack(">Q", self._need(8))[0]
+                data = self._need(n)
+            except (EOFError, OSError):
+                return None
+            op = b0 & 0x0F
+            if op == 8:
+                return None
+            if op == 9:
+                self.send(10, data)
+            elif op in (0, 1, 2):
+                msg += data
+                if b0 & 0x80:
+                    return msg.decode()
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def connect(path):
+    token = access_token()
+    try:
+        return WS(API_HOST, path, {"Authorization": f"Bearer {token}"})
+    except WSError as e:
+        if e.status != "401" or token == os.environ.get("XAI_API_KEY"):
+            raise
+        return WS(API_HOST, path, {"Authorization": f"Bearer {refresh_tokens(spent=token)}"})
+
+
+# ── audio in / out ────────────────────────────────────────────
+
+def pick_source():
+    """A real input, never a sink monitor: with a Bluetooth headset connected
+    for output only, PipeWire's default source is that headset's monitor, and
+    recording it captures system audio instead of your voice."""
+    forced = os.environ.get("AMAZING_GROK_SOURCE")
+    if forced or MAC or not shutil.which("pactl"):
+        return forced
+
+    def pactl(*args):
+        r = subprocess.run(["pactl", *args], capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    names = [p[1] for p in (line.split("\t") for line in pactl("list", "sources", "short").splitlines())
+             if len(p) > 1 and not p[1].endswith(".monitor")]
+    default = pactl("get-default-source")
+    if default in names:
+        return default
+    for want in ("bluez_input", "Mic1"):
+        for n in names:
+            if want in n:
+                return n
+    return names[0] if names else None
+
+
+def need(*tools):
+    for t in tools:
+        if shutil.which(t):
+            return t
+    hint = "brew install sox" if MAC else "install pipewire (pw-record/pw-play) or pulseaudio-utils"
+    raise RuntimeError(f"need one of {', '.join(tools)} — {hint}")
+
+
+def recorder(rate):
+    if MAC:
+        need("rec")
+        cmd = ["rec", "-q", "-t", "raw", "-r", str(rate), "-e", "signed", "-b", "16", "-c", "1", "-"]
+    elif need("pw-record", "parecord") == "pw-record":
+        cmd = ["pw-record", "--rate", str(rate), "--channels", "1", "--format", "s16", "-"]
+        src = pick_source()
+        if src:
+            cmd[1:1] = ["--target", src]
+    else:
+        cmd = ["parecord", "--raw", f"--rate={rate}", "--channels=1", "--format=s16le"]
+    log(f"recorder: {' '.join(cmd)}")
+    return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+
+def player(rate):
+    if MAC:
+        need("play")
+        cmd = ["play", "-q", "-t", "raw", "-r", str(rate), "-e", "signed", "-b", "16", "-c", "1", "-"]
+    elif need("pw-play", "pacat") == "pw-play":
+        cmd = ["pw-play", "--rate", str(rate), "--channels", "1", "--format", "s16", "-"]
+    else:
+        cmd = ["pacat", "--raw", f"--rate={rate}", "--channels=1", "--format=s16le"]
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+class DCBlocker:
+    """One-pole high-pass. Some laptop digital mics sit on a big DC offset,
+    which only hurts the server's speech detection."""
+
+    R = 0.995
+
+    def __init__(self):
+        self.x1 = self.y1 = 0.0
+
+    def __call__(self, data):
+        samples = array.array("h")
+        samples.frombytes(data[: len(data) // 2 * 2])
+        x1, y1, R = self.x1, self.y1, self.R
+        for i, x in enumerate(samples):
+            y1 = x - x1 + R * y1
+            x1 = x
+            samples[i] = max(-32768, min(32767, int(y1)))
+        self.x1, self.y1 = x1, y1
+        return samples.tobytes()
+
+
+def mic_queue(rec, chunk):
+    """Buffer the mic from the first moment, so connect latency loses no speech."""
+    audio, blocker = queue.Queue(), DCBlocker()
+
+    def pump():
+        while True:
+            data = rec.stdout.read(chunk)
+            audio.put(blocker(data) if data else None)
+            if not data:
+                return
+    threading.Thread(target=pump, daemon=True).start()
+    return audio
+
+
+# ── typing ────────────────────────────────────────────────────
+
+class Typer:
+    """Types into the focused window. On Linux the live (uncommitted) chunk is
+    kept on screen and edited in place as the server revises it; on macOS only
+    final chunks are typed, because AppleScript keystrokes are slow."""
+
+    def __init__(self):
+        self.typed = ""
+        self.joined = False
+        self.utt_chunks = 0
+        self.live = not MAC
+
+    def _keys(self, backspaces, text):
+        if MAC:
+            script = 'tell application "System Events"\n'
+            script += 'key code 51\n' * backspaces
+            if text:
+                script += f'keystroke "{text.replace(chr(92), chr(92) * 2).replace(chr(34), chr(92) + chr(34))}"\n'
+            cmd = ["osascript", "-e", script + "end tell"]
+        elif os.environ.get("WAYLAND_DISPLAY") and shutil.which("wtype"):
+            cmd = ["wtype"] + ["-k", "BackSpace"] * backspaces + (["--", text] if text else [])
+        else:
+            cmd = ["xdotool"] + (["key", "--repeat", str(backspaces), "BackSpace"] if backspaces else []) \
+                + (["type", "--", text] if text else [])
+        r = subprocess.run(cmd, stderr=subprocess.PIPE, text=True, check=False)
+        if r.returncode:
+            log(f"typing failed ({r.returncode}): {r.stderr.strip()}")
+
+    def _edit(self, target):
+        common = len(os.path.commonprefix([self.typed, target]))
+        back, add = len(self.typed) - common, target[common:]
+        if back or add:
+            self._keys(back, add)
+        self.typed = target
+
+    def event(self, ev):
+        text = ev.get("text", "").strip()
+        if ev.get("speech_final"):
+            # The stitched utterance repeats chunks already typed; only type it
+            # when no chunk of it was committed separately.
+            if self.utt_chunks == 0 and text:
+                self._commit(text)
+            self.utt_chunks = 0
+        elif text and ev.get("is_final"):
+            self._commit(text)
+            self.utt_chunks += 1
+        elif text and self.live:
+            self._edit((" " if self.joined else "") + text)
+
+    def _commit(self, text):
+        self._edit((" " if self.joined else "") + text)
+        self.joined = True
+        self.typed = ""
+
+
+# ── dictation ─────────────────────────────────────────────────
+
+def run_dictate():
+    LOG.write_text("")
+    PIDS["dictate"].write_text(str(os.getpid()))
+    stop = threading.Event()
+    for sig in (signal.SIGUSR1, signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: stop.set())
+    set_state("recording")
+    rec, ws = None, None
+    try:
+        rec = recorder(STT_RATE)
+        audio = mic_queue(rec, STT_RATE // 10 * 2)
+        query = urllib.parse.urlencode({
+            "model": STT_MODEL, "sample_rate": STT_RATE, "encoding": "pcm",
+            "interim_results": "true", "language": LANGUAGE, "format": "false"})
+        ws = connect(f"/v1/stt?{query}")
+        typer, done, failure = Typer(), threading.Event(), []
+
+        def listen():
+            while True:
+                raw = ws.recv()
+                if raw is None:
+                    break
+                ev = json.loads(raw)
+                kind = ev.get("type")
+                if kind == "transcript.partial":
+                    typer.event(ev)
+                elif kind == "error":
+                    failure.append(ev.get("message", "stream error"))
+                    break
+                elif kind == "transcript.done":
+                    break
+            done.set()
+        threading.Thread(target=listen, daemon=True).start()
+
+        started, stopping = time.time(), False
+        while not done.is_set():
+            if not stopping and (stop.is_set() or time.time() - started > MAX_DICTATE_S):
+                stopping = True
+                rec.terminate()
+                set_state("transcribing")
+            try:
+                data = audio.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if data is None:  # recorder drained: flush the last words
+                ws.send_json({"type": "finalize"})
+                ws.send_json({"type": "audio.done"})
+                done.wait(DONE_TIMEOUT_S)
+                break
+            ws.send(2, data)
+        if failure:
+            raise RuntimeError(failure[0])
+        set_state("idle")
+    except Exception as e:
+        log(f"dictate failed: {type(e).__name__}: {e}")
+        set_state("error", f"{type(e).__name__}: {e}")
+    finally:
+        if rec:
+            rec.terminate()
+        if ws:
+            ws.close()
+        PIDS["dictate"].unlink(missing_ok=True)
+
+
+# ── conversation ──────────────────────────────────────────────
+
+class Speaker:
+    """Plays Grok's PCM and knows roughly when playback will end, which is
+    what the echo gate needs."""
+
+    def __init__(self):
+        self.proc = player(TALK_RATE)
+        self.until = 0.0
+        self.lock = threading.Lock()
+
+    def play(self, pcm):
+        with self.lock:
+            self.until = max(self.until, time.time()) + len(pcm) / (TALK_RATE * 2)
+            try:
+                self.proc.stdin.write(pcm)
+                self.proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                self.proc = player(TALK_RATE)
+
+    def speaking(self):
+        return time.time() < self.until + ECHO_TAIL_S
+
+    def flush(self):
+        """Drop whatever is queued (you talked over Grok)."""
+        with self.lock:
+            self.proc.kill()
+            self.proc = player(TALK_RATE)
+            self.until = 0.0
+
+    def close(self):
+        self.proc.kill()
+
+
+def run_talk():
+    LOG.write_text("")
+    PIDS["talk"].write_text(str(os.getpid()))
+    stop = threading.Event()
+    for sig in (signal.SIGUSR1, signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: stop.set())
+    set_state("talking")
+    rec, ws, speaker = None, None, None
+    try:
+        rec = recorder(TALK_RATE)
+        audio = mic_queue(rec, TALK_RATE // 10 * 2)
+        speaker = Speaker()
+        ws = connect(f"/v1/realtime?model={urllib.parse.quote(VOICE_MODEL)}")
+        ws.send_json({"type": "session.update", "session": {
+            "instructions": INSTRUCTIONS,
+            "voice": VOICE,
+            "turn_detection": {"type": "server_vad"},
+            "audio": {
+                "input": {"format": {"type": "audio/pcm", "rate": TALK_RATE},
+                          "transcription": {"language_hint": LANGUAGE}},
+                "output": {"format": {"type": "audio/pcm", "rate": TALK_RATE}},
+            },
+            # Server-side tools: xAI runs the searches, nothing to do here.
+            "tools": [{"type": "web_search"}, {"type": "x_search"}],
+        }})
+        failure = []
+
+        def listen():
+            while not stop.is_set():
+                raw = ws.recv()
+                if raw is None:
+                    failure.append("connection closed")
+                    break
+                ev = json.loads(raw)
+                kind = ev.get("type", "")
+                if kind in ("response.output_audio.delta", "response.audio.delta"):
+                    speaker.play(base64.b64decode(ev["delta"]))
+                elif kind == "input_audio_buffer.speech_started" and BARGE_IN:
+                    speaker.flush()
+                elif kind == "response.output_audio_transcript.done":
+                    log(f"grok: {ev.get('transcript', '')}")
+                elif kind.startswith("conversation.item.input_audio_transcription") and ev.get("transcript"):
+                    log(f"you: {ev['transcript']}")
+                elif kind == "response.function_call_arguments.done":
+                    log(f"tool: {ev.get('name')} {ev.get('arguments')}")
+                elif kind == "error":
+                    log(f"error: {raw[:500]}")
+                    msg = (ev.get("error") or {}).get("message") if isinstance(ev.get("error"), dict) else None
+                    failure.append(msg or ev.get("message") or "stream error")
+                    break
+            stop.set()
+        threading.Thread(target=listen, daemon=True).start()
+
+        silence = bytes(TALK_RATE // 10 * 2)
+        started = time.time()
+        while not stop.is_set() and time.time() - started < MAX_TALK_S:
+            try:
+                data = audio.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if data is None:
+                raise RuntimeError("microphone stopped")
+            # Without headphones, send silence while Grok talks so it doesn't
+            # hear (and interrupt) itself.
+            if not BARGE_IN and speaker.speaking():
+                data = silence[: len(data)]
+            ws.send_json({"type": "input_audio_buffer.append", "audio": base64.b64encode(data).decode()})
+        if failure and failure[0] != "connection closed":
+            raise RuntimeError(failure[0])
+        set_state("idle")
+    except Exception as e:
+        log(f"talk failed: {type(e).__name__}: {e}")
+        set_state("error", f"{type(e).__name__}: {e}")
+    finally:
+        for p in (rec,):
+            if p:
+                p.terminate()
+        if speaker:
+            speaker.close()
+        if ws:
+            ws.close()
+        PIDS["talk"].unlink(missing_ok=True)
+
+
+# ── controls ──────────────────────────────────────────────────
+
+def spawn(mode):
+    RUN.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), f"_{mode}"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
+    # Claim the state now so a quick next press stops this session instead
+    # of racing to start another.
+    PIDS[mode].write_text(str(proc.pid))
+    set_state("talking" if mode == "talk" else "recording")
+
+
+def signal_stop(mode):
+    try:
+        os.kill(int(PIDS[mode].read_text()), signal.SIGUSR1)
+    except (OSError, ValueError):
+        pass
+
+
+def cmd_dictate():
+    state = read_state()
+    if state == "recording":
+        signal_stop("dictate")
+    elif state in ("idle", "error"):
+        spawn("dictate")
+
+
+def cmd_talk():
+    if alive("talk"):
+        signal_stop("talk")
+        return
+    if alive("dictate"):
+        signal_stop("dictate")
+    spawn("talk")
+
+
+def cmd_stop():
+    for mode in PIDS:
+        signal_stop(mode)
+
+
+def cmd_tap():
+    """Single press -> dictate, double press -> talk. The first press waits
+    DOUBLE_TAP_S to see whether a second one follows; a second press within
+    the window takes over and the first one does nothing."""
+    RUN.mkdir(parents=True, exist_ok=True)
+    if alive("talk"):  # hanging up is immediate
+        signal_stop("talk")
+        TAP.write_text("0")
+        return
+    with open(TAP, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.seek(0)
+        try:
+            last = float(f.read() or 0)
+        except ValueError:
+            last = 0.0
+        now = time.time()
+        double = now - last < DOUBLE_TAP_S
+        f.seek(0)
+        f.truncate()
+        f.write("0" if double else repr(now))
+    if double:
+        cmd_talk()
+        return
+    time.sleep(DOUBLE_TAP_S)
+    try:
+        mine = TAP.read_text() == repr(now)
+    except OSError:
+        mine = False
+    if mine:
+        cmd_dictate()
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "tap"
+    actions = {
+        "tap": cmd_tap, "talk": cmd_talk, "dictate": cmd_dictate, "stop": cmd_stop,
+        "login": cmd_login, "json": cmd_json, "status": lambda: print(read_state()),
+        "_dictate": run_dictate, "_talk": run_talk,
+    }
+    if cmd not in actions:
+        sys.exit(__doc__.strip().split("\n\n")[1])
+    try:
+        actions[cmd]()
+    except RuntimeError as e:
+        sys.exit(f"amazing-grok: {e}")
+
+
+if __name__ == "__main__":
+    main()

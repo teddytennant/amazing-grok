@@ -1,0 +1,48 @@
+amazing grok
+============
+
+Super fast, accurate transcription and real voice conversations with Grok,
+on Linux and macOS, using your xAI account (OAuth, no API key needed).
+
+  tap your hotkey once     dictate: words are typed into whatever window
+                           has focus as you speak; tap again to stop
+  tap it twice quickly     talk to Grok out loud; it answers back, and can
+                           search the web and X; tap once to hang up
+
+Getting started
+
+  1. Get the script (Python 3, no packages needed):
+
+       git clone https://github.com/teddytennant/amazing-grok
+       ln -s "$PWD/amazing-grok/amazing-grok" ~/.local/bin/amazing-grok
+
+     Linux needs PipeWire (pw-record/pw-play) and wtype (Wayland) or
+     xdotool (X11). macOS needs sox: brew install sox
+
+  2. Sign in with your xAI account:
+
+       amazing-grok login
+
+     (Already signed in to Wizard? That session is reused automatically.
+     XAI_API_KEY also works.)
+
+  3. Bind a key to `amazing-grok tap`.
+
+     Hyprland:  bind = , Super_R, exec, amazing-grok tap
+     sway:      bindsym Super_R exec amazing-grok tap
+     macOS:     use skhd, Hammerspoon or Raycast to run `amazing-grok tap`.
+                Give your terminal/hotkey app Accessibility permission (for
+                typing) and Microphone permission.
+
+  Or run it directly: amazing-grok dictate | talk | stop | status
+
+Options (environment variables)
+
+  AMAZING_GROK_VOICE=eve           Grok's voice
+  AMAZING_GROK_BARGE_IN=1          talk over Grok (use with headphones)
+  AMAZING_GROK_LANG=en             language
+  AMAZING_GROK_DOUBLE_TAP_MS=350   double-tap window
+  AMAZING_GROK_SOURCE=<name>       PipeWire mic to use
+
+Waybar: a custom module with "exec": "amazing-grok json", "signal": 2,
+"return-type": "json" shows what's running. Log: $XDG_RUNTIME_DIR/amazing-grok/log
