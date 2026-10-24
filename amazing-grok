@@ -50,6 +50,25 @@ from pathlib import Path
 
 MAC = sys.platform == "darwin"
 
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "amazing-grok"
+
+
+def load_config():
+    """~/.config/amazing-grok/config holds AMAZING_GROK_*=value lines, the
+    same names as the environment variables (which win over the file)."""
+    try:
+        lines = (CONFIG / "config").read_text().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if sep and key.startswith("AMAZING_GROK_") and not line.lstrip().startswith("#"):
+            os.environ.setdefault(key, value.strip().strip('"'))
+
+
+load_config()
+
 API_HOST = "api.x.ai"
 STT_MODEL = "grok-voice-transcribe-2.0"
 VOICE_MODEL = os.environ.get("AMAZING_GROK_MODEL", "grok-voice-3.0")
@@ -60,6 +79,11 @@ INSTRUCTIONS = os.environ.get("AMAZING_GROK_INSTRUCTIONS", (
     "Keep replies short and conversational, like a friend on a call: no lists, "
     "no markdown, no reading out URLs. For anything current, news, prices, "
     "weather or what people are saying, use web_search or x_search first."))
+# Playback speed of Grok's voice, done by the server (0.7 is slow, 2 is fast).
+SPEED = float(os.environ.get("AMAZING_GROK_SPEED", "1"))
+# How long a pause means you're done talking. Too short and Grok jumps in
+# while you're thinking; too long and replies feel slow.
+PAUSE_MS = int(os.environ.get("AMAZING_GROK_PAUSE_MS", "900"))
 # With speakers instead of headphones Grok hears itself and interrupts itself,
 # so the mic is muted while Grok speaks. Set AMAZING_GROK_BARGE_IN=1 with
 # headphones to be able to talk over it.
@@ -80,7 +104,6 @@ CALLBACK_PORT = 56121
 DISCOVERY_URL = "https://auth.x.ai/.well-known/openid-configuration"
 EXPIRY_LEEWAY_S = 120
 
-CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "amazing-grok"
 OWN_TOKENS = CONFIG / "xai_oauth.json"
 WIZARD_TOKENS = Path.home() / ".wizard" / "xai_oauth.json"
 RUN = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/amazing-grok-{os.getuid()}") / "amazing-grok"
@@ -650,11 +673,12 @@ def run_talk():
         ws.send_json({"type": "session.update", "session": {
             "instructions": INSTRUCTIONS,
             "voice": VOICE,
-            "turn_detection": {"type": "server_vad"},
+            "turn_detection": {"type": "server_vad", "silence_duration_ms": PAUSE_MS,
+                               "prefix_padding_ms": 300},
             "audio": {
                 "input": {"format": {"type": "audio/pcm", "rate": TALK_RATE},
                           "transcription": {"language_hint": LANGUAGE}},
-                "output": {"format": {"type": "audio/pcm", "rate": TALK_RATE}},
+                "output": {"format": {"type": "audio/pcm", "rate": TALK_RATE}, "speed": SPEED},
             },
             # Server-side tools: xAI runs the searches, nothing to do here.
             "tools": [{"type": "web_search"}, {"type": "x_search"}],

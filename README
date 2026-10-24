@@ -36,8 +36,14 @@ Getting started
 
   Or run it directly: amazing-grok dictate | talk | stop | status
 
-Options (environment variables)
+Options
 
+  Put these in ~/.config/amazing-grok/config (one per line), or set them as
+  environment variables:
+
+  AMAZING_GROK_SPEED=1             how fast Grok talks, 0.7 to 2
+  AMAZING_GROK_PAUSE_MS=900        how long a pause means you're done talking
+                                   (raise it if Grok cuts you off)
   AMAZING_GROK_VOICE=eve           Grok's voice
   AMAZING_GROK_BARGE_IN=1          talk over Grok (use with headphones)
   AMAZING_GROK_LANG=en             language
