@@ -30,11 +30,34 @@ Getting started
 
      Hyprland:  bind = , Super_R, exec, amazing-grok tap
      sway:      bindsym Super_R exec amazing-grok tap
-     macOS:     use skhd, Hammerspoon or Raycast to run `amazing-grok tap`.
-                Give your terminal/hotkey app Accessibility permission (for
-                typing) and Microphone permission.
+     macOS:     use the menu bar app below (Option key, no setup), or have
+                skhd, Hammerspoon or Raycast run `amazing-grok tap` and give
+                that app Accessibility and Microphone permission.
 
   Or run it directly: amazing-grok dictate | talk | stop | status
+
+macOS
+
+  A small menu bar app gives you the hotkey and a status icon:
+
+    brew install uv sox
+    amazing-grok/macos/build.sh
+    open ~/Applications/"Amazing Grok.app"
+
+  Allow Input Monitoring, Accessibility and Microphone for Amazing Grok when
+  macOS asks (System Settings › Privacy & Security). Then:
+
+    tap Option            dictate; tap again to stop
+    double tap Option     talk to Grok; tap once to hang up
+
+  A tap is Option pressed and released on its own, so Option shortcuts
+  (AeroSpace's alt-1, alt-shift-h, ...) never trigger it. Words are typed
+  live as you speak, and the icon shows what's happening: white waveform
+  idle, red while dictating, blue while talking to Grok.
+
+  To start it at login, add it in System Settings › General › Login Items.
+  AMAZING_GROK_OPTION=left|right limits the hotkey to one Option key.
+  Log: ~/Library/Logs/amazing-grok.log
 
 Options
 

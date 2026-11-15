@@ -503,25 +503,62 @@ def mic_queue(rec, chunk):
 
 # ── typing ────────────────────────────────────────────────────
 
+class MacKeys:
+    """Posts key events straight to CoreGraphics through ctypes. Fast enough to
+    keep the live chunk on screen, unlike AppleScript keystrokes, and it needs
+    no packages. Needs Accessibility permission for whatever runs us."""
+
+    BACKSPACE = 51
+    SESSION_TAP = 1  # kCGSessionEventTap
+
+    def __init__(self):
+        import ctypes
+        cg = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+        cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
+        cg.CGEventCreateKeyboardEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]
+        cg.CGEventKeyboardSetUnicodeString.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p]
+        cg.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        cg.CFRelease.argtypes = [ctypes.c_void_p]
+        self.cg, self.ctypes = cg, ctypes
+
+    def _post(self, keycode, down, units=None):
+        ev = self.cg.CGEventCreateKeyboardEvent(None, keycode, down)
+        if units is not None:
+            buf = self.ctypes.create_string_buffer(units, len(units))
+            self.cg.CGEventKeyboardSetUnicodeString(ev, len(units) // 2, buf)
+        self.cg.CGEventSetFlags(ev, 0)  # a held modifier must not turn "s" into "ß"
+        self.cg.CGEventPost(self.SESSION_TAP, ev)
+        self.cg.CFRelease(ev)
+
+    def __call__(self, backspaces, text):
+        for _ in range(backspaces):
+            self._post(self.BACKSPACE, True)
+            self._post(self.BACKSPACE, False)
+            time.sleep(0.002)
+        for i in range(0, len(text), 16):  # whole characters, so no split surrogate pairs
+            units = text[i:i + 16].encode("utf-16-le")
+            self._post(0, True, units)
+            self._post(0, False, units)
+            time.sleep(0.004)
+
+
 class Typer:
-    """Types into the focused window. On Linux the live (uncommitted) chunk is
-    kept on screen and edited in place as the server revises it; on macOS only
-    final chunks are typed, because AppleScript keystrokes are slow."""
+    """Types into the focused window. The live (uncommitted) chunk is kept on
+    screen and edited in place as the server revises it."""
 
     def __init__(self):
         self.typed = ""
         self.joined = False
         self.utt_chunks = 0
-        self.live = not MAC
+        self.mac_keys = MacKeys() if MAC else None
 
     def _keys(self, backspaces, text):
-        if MAC:
-            script = 'tell application "System Events"\n'
-            script += 'key code 51\n' * backspaces
-            if text:
-                script += f'keystroke "{text.replace(chr(92), chr(92) * 2).replace(chr(34), chr(92) + chr(34))}"\n'
-            cmd = ["osascript", "-e", script + "end tell"]
-        elif os.environ.get("WAYLAND_DISPLAY") and shutil.which("wtype"):
+        if self.mac_keys:
+            self.mac_keys(backspaces, text)
+            return
+        if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wtype"):
             cmd = ["wtype"] + ["-k", "BackSpace"] * backspaces + (["--", text] if text else [])
         else:
             cmd = ["xdotool"] + (["key", "--repeat", str(backspaces), "BackSpace"] if backspaces else []) \
@@ -548,7 +585,7 @@ class Typer:
         elif text and ev.get("is_final"):
             self._commit(text)
             self.utt_chunks += 1
-        elif text and self.live:
+        elif text:
             self._edit((" " if self.joined else "") + text)
 
     def _commit(self, text):
